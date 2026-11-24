@@ -1,9 +1,21 @@
 __pycache__/
 *.py[cod]
+.DS_Store
 .caritas-local.env
+.caritas-settings.env
+.caritas-restored
+backup/
 
 data/*
 !data/.gitkeep
+!data/README.md
+!data/codebook.csv
+!data/en/
+data/en/*
+!data/en/counselling_events.csv
+!data/de/
+data/de/*
+!data/de/beratungsdaten_synthesized.csv
 
 exports/*
 !exports/.gitkeep

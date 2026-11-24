@@ -7,7 +7,7 @@ import argparse
 import re
 import sys
 import uuid
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -47,11 +47,45 @@ DATE_FORMATS = (
     "%d/%m/%Y %H:%M",
     "%d/%m/%Y",
 )
-NUMBER_LIKE_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)*$")
+NUMBER_LIKE_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?$")
 INTEGER_WITH_LEADING_ZERO_RE = re.compile(r"^[+-]?0\d+$")
-LEADING_NUMBER_RE = re.compile(r"^\s*([+-]?\d+(?:[.,]\d+)?)")
+LEADING_NUMBER_RE = re.compile(r"^\s*([+-]?\d+(?:[.,]\d+)?(?:[eE][+-]?\d+)?)")
 POSTGRES_TYPES = {"text", "date", "timestamp", "integer", "bigint", "numeric"}
-STAGING_TRANSFORMS = {"none", "leading_number"}
+TEXT_TRANSFORMS = [
+    ("none", "Keep value"),
+    ("trim", "Trim spaces"),
+    ("lower", "Lowercase"),
+    ("upper", "Uppercase"),
+    ("leading_number", "Extract leading number"),
+]
+NUMBER_TRANSFORMS = [
+    ("none", "Keep value"),
+    ("leading_number", "Extract leading number"),
+    ("decimal_comma", "Decimal comma (1.234,56)"),
+    ("decimal_point", "Decimal point (1,234.56)"),
+]
+DATE_TRANSFORMS = [
+    ("none", "Keep value"),
+    ("date_dmy", "Day / month / year"),
+    ("date_mdy", "Month / day / year"),
+    ("date_iso", "Year / month / day"),
+    ("excel_serial", "Excel serial date"),
+]
+TRANSFORM_OPTIONS_BY_TYPE = {
+    "text": TEXT_TRANSFORMS,
+    "integer": NUMBER_TRANSFORMS,
+    "bigint": NUMBER_TRANSFORMS,
+    "numeric": NUMBER_TRANSFORMS,
+    "date": DATE_TRANSFORMS,
+    "timestamp": DATE_TRANSFORMS,
+}
+STAGING_TRANSFORMS = {
+    name for options in TRANSFORM_OPTIONS_BY_TYPE.values() for name, _ in options
+}
+STAGING_METADATA_COLUMNS = {
+    "import_row_id", "batch_id", "source_file", "sheet_name",
+    "source_row_number", "loaded_at",
+}
 
 
 def sanitize_identifier(value: object, fallback: str) -> str:
@@ -66,13 +100,17 @@ def sanitize_identifier(value: object, fallback: str) -> str:
 
 
 def unique_identifiers(values: list[object]) -> list[str]:
-    seen: dict[str, int] = {}
+    seen = set(STAGING_METADATA_COLUMNS)
     result: list[str] = []
     for index, value in enumerate(values, start=1):
         base = sanitize_identifier(value, f"column_{index}")
-        count = seen.get(base, 0) + 1
-        seen[base] = count
-        result.append(base if count == 1 else f"{base}_{count}")
+        candidate = base
+        count = 1
+        while candidate in seen:
+            count += 1
+            candidate = f"{base}_{count}"
+        seen.add(candidate)
+        result.append(candidate)
     return result
 
 
@@ -119,6 +157,8 @@ def is_postal_code_column(column_name: str) -> bool:
 def parse_datetime_value(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
+    if isinstance(value, date):
+        return datetime.combine(value, time.min)
 
     text = cell_text(value)
     if text is None:
@@ -137,11 +177,15 @@ def parse_datetime_value(value: object) -> datetime | None:
 
 
 def parse_decimal_value(value: object) -> Decimal | None:
+    # Locale transforms already return exact decimals, including values whose
+    # string representation uses an exponent (for example Decimal("1E-8")).
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
     text = cell_text(value)
     if text is None:
         return None
 
-    text = text.replace("\u00a0", " ").replace("'", "").replace(" ", "")
+    text = re.sub(r"[\s'\u2019]", "", text)
     if not NUMBER_LIKE_RE.match(text):
         return None
 
@@ -183,7 +227,8 @@ def infer_column_type(column_name: str, values: pd.Series) -> str:
     parsed_numbers = [parse_decimal_value(value) for value in non_empty_values]
     if all(value is not None for value in parsed_numbers):
         has_decimal_marker = any(
-            text is not None and ("." in text or "," in text) for text in number_texts
+            text is not None and ("." in text or "," in text or "e" in text.lower())
+            for text in number_texts
         )
         if not has_decimal_marker and all(
             value == value.to_integral_value()
@@ -193,7 +238,9 @@ def infer_column_type(column_name: str, values: pd.Series) -> str:
             integers = [int(value) for value in parsed_numbers if value is not None]
             if all(-(2**31) <= value <= 2**31 - 1 for value in integers):
                 return "integer"
-            return "bigint"
+            if all(-(2**63) <= value <= 2**63 - 1 for value in integers):
+                return "bigint"
+            return "numeric"
         return "numeric"
 
     return "text"
@@ -213,7 +260,7 @@ def convert_staging_value(
         return None
 
     if column_type == "text":
-        return value
+        return str(value)
     if column_type in {"date", "timestamp"}:
         parsed = parse_datetime_value(value)
         if parsed is None:
@@ -223,6 +270,13 @@ def convert_staging_value(
         parsed = parse_decimal_value(value)
         if parsed is None or parsed != parsed.to_integral_value():
             raise ValueError(f"{column_name}: expected integer, got {value!r}")
+        bits = 32 if column_type == "integer" else 64
+        if not -(2 ** (bits - 1)) <= parsed <= 2 ** (bits - 1) - 1:
+            raise ValueError(
+                f"{column_name}: {value!r} is outside the {column_type} range "
+                f"({-(2 ** (bits - 1))} to {2 ** (bits - 1) - 1}). "
+                "Choose a larger number type."
+            )
         return int(parsed)
     if column_type == "numeric":
         parsed = parse_decimal_value(value)
@@ -238,16 +292,102 @@ def convert_staging_value(
 def apply_staging_transform(
     column_name: str, value: object, transform: str
 ) -> object | None:
+    if transform not in STAGING_TRANSFORMS:
+        raise ValueError(f"Unsupported transform for {column_name}: {transform}")
     value = clean_cell_value(value)
     if value is None or transform == "none":
         return value
 
+    text = cell_text(value) or ""
+    if transform == "trim":
+        return text
+    if transform == "lower":
+        return str(value).lower()
+    if transform == "upper":
+        return str(value).upper()
     if transform == "leading_number":
-        text = cell_text(value)
-        match = LEADING_NUMBER_RE.match(text or "")
-        return match.group(1) if match else None
+        match = LEADING_NUMBER_RE.match(text)
+        if not match:
+            raise ValueError(f"{column_name}: {value!r} has no leading number.")
+        return match.group(1)
+
+    if transform in {"decimal_comma", "decimal_point"}:
+        text = re.sub(r"[\s'\u2019]", "", text)
+        separator, grouping = (",", ".") if transform == "decimal_comma" else (".", ",")
+        pattern = rf"[+-]?(?:\d{{1,3}}(?:{re.escape(grouping)}\d{{3}})+|\d+)(?:{re.escape(separator)}\d+)?(?:[eE][+-]?\d+)?"
+        if not re.fullmatch(pattern, text):
+            raise ValueError(f"{column_name}: {value!r} does not match the selected number format.")
+        return Decimal(text.replace(grouping, "").replace(separator, "."))
+
+    if transform in {"date_dmy", "date_mdy", "date_iso"}:
+        if isinstance(value, (date, datetime)):
+            return value
+        order = {"date_dmy": ("%d", "%m", "%Y"),
+                 "date_mdy": ("%m", "%d", "%Y"),
+                 "date_iso": ("%Y", "%m", "%d")}[transform]
+        for separator in ("/", ".", "-"):
+            for suffix in ("", " %H:%M", " %H:%M:%S", " %H:%M:%S.%f"):
+                try:
+                    return datetime.strptime(text.replace("T", " "), separator.join(order) + suffix)
+                except ValueError:
+                    continue
+        raise ValueError(f"{column_name}: {value!r} does not match the selected date format.")
+
+    if transform == "excel_serial":
+        number = parse_decimal_value(value)
+        if number is None or not 1 <= number < 2958466:
+            raise ValueError(f"{column_name}: expected an Excel serial date from 1 to 2958465, got {value!r}.")
+        # Excel's 1900 calendar includes a fictitious leap day at serial 60.
+        if 60 <= number < 61:
+            raise ValueError(f"{column_name}: Excel serial 60 is the nonexistent date 1900-02-29.")
+        if number < 60:
+            number += 1
+        try:
+            return datetime(1899, 12, 30) + timedelta(days=float(number))
+        except OverflowError as exc:
+            raise ValueError(f"{column_name}: Excel serial date is out of range.") from exc
 
     raise ValueError(f"Unsupported transform for {column_name}: {transform}")
+
+
+def validate_column_options(column_name: str, column_type: str, transform: str) -> None:
+    if column_type not in POSTGRES_TYPES:
+        raise ValueError(f"Unsupported type for {column_name}: {column_type}")
+    allowed = {name for name, _ in TRANSFORM_OPTIONS_BY_TYPE[column_type]}
+    if transform not in allowed:
+        raise ValueError(f"{column_name}: transform {transform!r} cannot be used with {column_type}.")
+
+
+def validate_column(
+    values, column_name: str, column_type: str, transform: str = "none", sample_limit: int = 5
+) -> dict[str, object]:
+    """Check every cell using the exact conversion used for database insertion."""
+    result = {"valid_count": 0, "empty_count": 0, "invalid_count": 0,
+              "valid_examples": [], "invalid_examples": [], "errors": []}
+    try:
+        validate_column_options(column_name, column_type, transform)
+    except ValueError as exc:
+        result["errors"].append(str(exc))
+        return result
+    for row_number, value in enumerate(values, start=1):
+        if clean_cell_value(value) is None:
+            result["empty_count"] += 1
+            continue
+        example = {"row_number": row_number, "source_row_number": row_number + 1,
+                   "value": str(value)}
+        try:
+            converted = convert_staging_value(
+                column_name, apply_staging_transform(column_name, value, transform), column_type
+            )
+        except ValueError as exc:
+            result["invalid_count"] += 1
+            if len(result["invalid_examples"]) < sample_limit:
+                result["invalid_examples"].append({**example, "error": str(exc)})
+        else:
+            result["valid_count"] += 1
+            if len(result["valid_examples"]) < sample_limit:
+                result["valid_examples"].append({**example, "converted": str(converted)})
+    return result
 
 
 def load_frames(path: Path) -> list[tuple[str | None, pd.DataFrame]]:
@@ -257,7 +397,7 @@ def load_frames(path: Path) -> list[tuple[str | None, pd.DataFrame]]:
         raise ValueError(f"Unsupported file type '{extension}'. Supported: {supported}")
 
     if extension == ".csv":
-        return [(None, pd.read_csv(path, dtype=str, keep_default_na=False))]
+        return [(None, pd.read_csv(path, dtype=str, keep_default_na=False, skip_blank_lines=False))]
 
     sheets = pd.read_excel(path, sheet_name=None, dtype=str, keep_default_na=False)
     return list(sheets.items())
@@ -304,7 +444,30 @@ def bootstrap(conn) -> None:
             """)
 
 
+def staging_schema_conflicts(conn, table_name: str, column_types: dict[str, str]) -> list[str]:
+    """Appending must not silently ignore the types selected in the importer."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT column_name, data_type FROM information_schema.columns
+               WHERE table_schema = 'staging' AND table_name = %s""",
+            (table_name,),
+        )
+        existing = dict(cur.fetchall())
+    aliases = {"timestamp without time zone": "timestamp"}
+    return [
+        f"staging.{table_name}.{column}: existing type is {aliases.get(existing[column], existing[column])}, "
+        f"but you selected {column_type}. Choose the existing type or replace the table."
+        for column, column_type in column_types.items()
+        if column in existing and aliases.get(existing[column], existing[column]) != column_type
+    ]
+
+
 def ensure_staging_table(conn, table_name: str, column_types: dict[str, str]) -> None:
+    for column, column_type in column_types.items():
+        validate_column_options(column, column_type, "none")
+    conflicts = staging_schema_conflicts(conn, table_name, column_types)
+    if conflicts:
+        raise ValueError(" ".join(conflicts))
     with conn.cursor() as cur:
         cur.execute(sql.SQL("""
                 CREATE TABLE IF NOT EXISTS staging.{table} (
@@ -375,10 +538,11 @@ def insert_frame(
     column_transforms = {
         column: (column_transforms or {}).get(column, "none") for column in columns
     }
-    invalid_transforms = set(column_transforms.values()) - STAGING_TRANSFORMS
-    if invalid_transforms:
-        invalid = ", ".join(sorted(invalid_transforms))
-        raise ValueError(f"Unsupported transform value: {invalid}")
+    unknown_columns = set(column_types) - set(columns)
+    if unknown_columns:
+        raise ValueError(f"Unknown columns: {', '.join(sorted(unknown_columns))}")
+    for column in columns:
+        validate_column_options(column, column_types[column], column_transforms[column])
     ensure_staging_table(conn, table_name, column_types)
 
     with conn.cursor() as cur:

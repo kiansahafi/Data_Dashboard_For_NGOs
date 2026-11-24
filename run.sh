@@ -3,6 +3,14 @@ set -Eeuo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LOCAL_ENV_FILE="$PROJECT_DIR/.caritas-local.env"
+SETTINGS_FILE="$PROJECT_DIR/.caritas-settings.env"
+
+# A restored backup carries its database credentials and Superset encryption key.
+# Generated settings only fill unset variables, so explicit overrides still work.
+if [ -f "$SETTINGS_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$SETTINGS_FILE"
+fi
 
 USER_SET_POSTGRES_PORT="${POSTGRES_PORT+x}"
 USER_POSTGRES_PORT="${POSTGRES_PORT-}"
@@ -53,11 +61,34 @@ SUPERSET_ADMIN_PASSWORD="${SUPERSET_ADMIN_PASSWORD:-admin}"
 SUPERSET_ADMIN_EMAIL="${SUPERSET_ADMIN_EMAIL:-admin@local.invalid}"
 SUPERSET_SECRET_KEY="${SUPERSET_SECRET_KEY:-caritas-local-only-secret-key-change-me-before-sharing-2026}"
 SUPERSET_DATABASE_LABEL="${SUPERSET_DATABASE_LABEL:-Caritas Local PostgreSQL}"
-ANALYTICS_SQLALCHEMY_URI="${ANALYTICS_SQLALCHEMY_URI:-postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_CONTAINER}:5432/${POSTGRES_DB}}"
+
+urlencode_component() {
+  local LC_ALL=C value="$1" character index
+  for ((index=0; index<${#value}; index++)); do
+    character="${value:index:1}"
+    case "$character" in
+      [a-zA-Z0-9.~_-]) printf '%s' "$character" ;;
+      *) printf '%%%02X' "'$character" ;;
+    esac
+  done
+}
+
+ANALYTICS_SQLALCHEMY_URI="${ANALYTICS_SQLALCHEMY_URI:-postgresql+psycopg2://$(urlencode_component "$POSTGRES_USER"):$(urlencode_component "$POSTGRES_PASSWORD")@${POSTGRES_CONTAINER}:5432/$(urlencode_component "$POSTGRES_DB")}"
 
 DATA_DIR="$PROJECT_DIR/data"
 EXPORTS_DIR="$PROJECT_DIR/exports"
 SUPERSET_CONFIG_DIR="$PROJECT_DIR/superset"
+
+# Only these public examples travel with the app. Other source data stays out
+# of the portable package; imported database rows are already in its dump.
+PUBLIC_DEMO_FILES=(
+  data/README.md
+  data/codebook.csv
+  data/en/counselling_events.csv
+  data/de/beratungsdaten_synthesized.csv
+  sql/schema_en.sql
+  sql/schema_de.sql
+)
 
 log() {
   printf '[caritas] %s\n' "$*"
@@ -77,7 +108,8 @@ Usage:
   ./run.sh stop                  Stop containers without deleting data
   ./run.sh status                Show container status and local URLs
   ./run.sh import data/file.xlsx Import a CSV/XLS/XLSX file into staging tables
-  ./run.sh backup                Export PostgreSQL dump and Superset metadata archive
+  ./run.sh backup                Create a complete, portable backup in exports/
+  ./run.sh restore               Restore and start this portable backup on a fresh installation
   ./run.sh build                 Build local helper images
   ./run.sh reset                 Delete containers and persistent volumes after confirmation
   ./run.sh help                  Show this help
@@ -86,6 +118,7 @@ Superset:
   URL:      http://127.0.0.1:8088
   Username: admin
   Password: admin
+  Restored backups keep their original Superset accounts.
 
 Import UI:
   URL:      http://127.0.0.1:8090
@@ -405,8 +438,9 @@ setup_superset_metadata() {
   log "Running Superset metadata migrations."
   run_superset_once superset db upgrade
 
-  log "Ensuring Superset admin user exists."
-  if run_superset_once superset fab create-admin \
+  if [ "${RESTORING_BACKUP:-0}" = "1" ] || [ -f "$PROJECT_DIR/.caritas-restored" ]; then
+    log "Keeping the Superset user accounts restored from backup."
+  elif run_superset_once superset fab create-admin \
     --username "$SUPERSET_ADMIN_USER" \
     --firstname Local \
     --lastname Admin \
@@ -559,6 +593,9 @@ start_import_ui() {
 }
 
 cmd_start() {
+  if [ -f "$PROJECT_DIR/backup/format" ] && [ ! -f "$PROJECT_DIR/.caritas-restored" ]; then
+    die "This is a portable backup. Restore it first with ./run.sh restore"
+  fi
   require_podman
   ensure_dirs
   ensure_network
@@ -572,7 +609,11 @@ cmd_start() {
   log "Ready."
   log "Superset:   http://127.0.0.1:${SUPERSET_PORT}"
   log "Import UI:  http://127.0.0.1:${IMPORT_UI_PORT}"
-  log "Login:      ${SUPERSET_ADMIN_USER} / ${SUPERSET_ADMIN_PASSWORD}"
+  if [ -f "$PROJECT_DIR/.caritas-restored" ]; then
+    log "Login:      Use your Superset account from the backup."
+  else
+    log "Login:      ${SUPERSET_ADMIN_USER} / ${SUPERSET_ADMIN_PASSWORD}"
+  fi
   log "PostgreSQL: 127.0.0.1:${POSTGRES_PORT} database=${POSTGRES_DB} user=${POSTGRES_USER}"
 }
 
@@ -653,33 +694,251 @@ cmd_import() {
     python scripts/import_staging.py "$container_file"
 }
 
-cmd_backup() {
+checksum_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+  else
+    die "Backups require sha256sum or shasum to check file integrity."
+  fi
+}
+
+write_settings() {
+  local output="$1" key value
+  : > "$output"
+  chmod 600 "$output"
+  for key in NETWORK_NAME POSTGRES_IMAGE SUPERSET_IMAGE INGEST_IMAGE \
+    POSTGRES_CONTAINER SUPERSET_CONTAINER IMPORT_UI_CONTAINER \
+    POSTGRES_VOLUME SUPERSET_VOLUME POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
+    SUPERSET_SECRET_KEY SUPERSET_ADMIN_USER SUPERSET_ADMIN_PASSWORD \
+    SUPERSET_ADMIN_EMAIL SUPERSET_DATABASE_LABEL; do
+    value="${!key}"
+    printf 'if [ -z "${%s+x}" ]; then %s=%q; fi\n' "$key" "$key" "$value" >> "$output"
+  done
+}
+
+capture_backup_settings() {
+  local scratch="$1" entry
+  # Read the actual container credentials, including settings supplied only at
+  # its original start. NUL separators preserve spaces and newlines in secrets.
+  podman inspect --format '{{range .Config.Env}}{{printf "%s\x00" .}}{{end}}' \
+    "$POSTGRES_CONTAINER" > "$scratch"
+  while IFS= read -r -d '' entry; do
+    case "$entry" in
+      POSTGRES_DB=*) POSTGRES_DB="${entry#*=}" ;;
+      POSTGRES_USER=*) POSTGRES_USER="${entry#*=}" ;;
+      POSTGRES_PASSWORD=*) POSTGRES_PASSWORD="${entry#*=}" ;;
+    esac
+  done < "$scratch"
+  podman inspect --format '{{range .Config.Env}}{{printf "%s\x00" .}}{{end}}' \
+    "$SUPERSET_CONTAINER" > "$scratch"
+  while IFS= read -r -d '' entry; do
+    case "$entry" in
+      SUPERSET_SECRET_KEY=*) SUPERSET_SECRET_KEY="${entry#*=}" ;;
+      SUPERSET_DATABASE_LABEL=*) SUPERSET_DATABASE_LABEL="${entry#*=}" ;;
+    esac
+  done < "$scratch"
+  rm "$scratch"
+  POSTGRES_IMAGE="$(podman inspect --format '{{.ImageName}}' "$POSTGRES_CONTAINER")"
+  SUPERSET_IMAGE="$(podman inspect --format '{{.ImageName}}' "$SUPERSET_CONTAINER")"
+  if container_exists "$IMPORT_UI_CONTAINER"; then
+    INGEST_IMAGE="$(podman inspect --format '{{.ImageName}}' "$IMPORT_UI_CONTAINER")"
+  fi
+}
+
+cmd_backup() (
+  # The subshell keeps cleanup traps local to this command.
+  umask 077
   require_podman
   ensure_dirs
-
   container_running "$POSTGRES_CONTAINER" || die "PostgreSQL is not running. Start it first with ./run.sh start"
+  container_exists "$SUPERSET_CONTAINER" || die "Superset has not been set up. Run ./run.sh start first."
 
-  local stamp db_dump superset_archive
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  db_dump="$EXPORTS_DIR/caritas-postgres-$stamp.dump"
-  superset_archive="$EXPORTS_DIR/caritas-superset-home-$stamp.tgz"
+  local stamp package partial relative digest success=0 container
+  local paused=()
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  package="$EXPORTS_DIR/caritas-backup-$stamp"
+  partial="$package.partial"
+  mkdir -m 700 "$partial"
+  backup_cleanup() {
+    local result=$? item
+    trap - EXIT
+    for item in ${paused[@]+"${paused[@]}"}; do
+      if ! podman start "$item" >/dev/null; then
+        log "Could not restart $item after backup. Run ./run.sh start."
+        result=1
+      fi
+    done
+    if [ "$success" -ne 1 ]; then
+      rm -rf "$partial"
+      log "Backup failed; no complete backup was published."
+    fi
+    exit "$result"
+  }
+  trap backup_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  mkdir "$partial/backup" "$partial/scripts" "$partial/superset" "$partial/data" "$partial/exports"
+  capture_backup_settings "$partial/backup/.container-env"
+  write_settings "$partial/.caritas-settings.env"
+  cp "$PROJECT_DIR/run.sh" "$PROJECT_DIR/Containerfile.ingest" "$PROJECT_DIR/Containerfile.superset" "$partial/"
+  cp "$PROJECT_DIR/scripts/"*.py "$partial/scripts/"
+  cp "$SUPERSET_CONFIG_DIR/"*.py "$partial/superset/"
+  for relative in README.md docs; do
+    if [ -e "$PROJECT_DIR/$relative" ]; then
+      cp -R "$PROJECT_DIR/$relative" "$partial/"
+    fi
+  done
+  for relative in "${PUBLIC_DEMO_FILES[@]}"; do
+    if [ -f "$PROJECT_DIR/$relative" ]; then
+      mkdir -p "$partial/$(dirname "$relative")"
+      cp "$PROJECT_DIR/$relative" "$partial/$relative"
+    fi
+  done
+  printf 'caritas-portable-backup-v1\n' > "$partial/backup/format"
+  podman info --format '{{.Host.Arch}}' > "$partial/backup/architecture"
 
-  log "Writing PostgreSQL dump: $db_dump"
+  # Stop writers while copying SQLite metadata and taking the PostgreSQL snapshot.
+  for container in "$IMPORT_UI_CONTAINER" "$SUPERSET_CONTAINER"; do
+    if container_running "$container"; then
+      paused+=("$container")
+      podman stop "$container" >/dev/null
+    fi
+  done
+  log "Saving PostgreSQL data and Superset metadata."
   podman exec "$POSTGRES_CONTAINER" pg_dump \
     -U "$POSTGRES_USER" \
     -d "$POSTGRES_DB" \
-    -Fc > "$db_dump"
-
-  log "Writing Superset metadata archive: $superset_archive"
-  ensure_postgres_image
+    -Fc --no-owner --no-acl > "$partial/backup/postgres.dump"
   podman run --rm \
     -v "$SUPERSET_VOLUME:/volume:ro" \
-    -v "$EXPORTS_DIR:/exports" \
+    -v "$partial/backup:/backup" \
     "$POSTGRES_IMAGE" \
-    tar -czf "/exports/$(basename "$superset_archive")" -C /volume .
+    tar -czf /backup/superset-home.tgz -C /volume .
+  # Resume the UI before the larger image export.
+  for container in ${paused[@]+"${paused[@]}"}; do
+    podman start "$container" >/dev/null
+  done
+  paused=()
+  log "Saving container images for offline installation. This may take a few minutes."
+  podman save --multi-image-archive --format docker-archive \
+    -o "$partial/backup/images.tar" "$POSTGRES_IMAGE" "$SUPERSET_IMAGE" "$INGEST_IMAGE"
+  for relative in backup/postgres.dump backup/superset-home.tgz backup/images.tar; do
+    [ -s "$partial/$relative" ] || die "Backup file is empty: $relative"
+  done
+  (
+    cd "$partial"
+    for relative in run.sh Containerfile.ingest Containerfile.superset \
+      .caritas-settings.env scripts/*.py superset/*.py backup/format \
+      backup/architecture backup/postgres.dump backup/superset-home.tgz backup/images.tar; do
+      digest="$(checksum_file "$relative")"
+      printf '%s  %s\n' "$digest" "$relative"
+    done > backup/SHA256SUMS
+    for relative in "${PUBLIC_DEMO_FILES[@]}"; do
+      if [ -f "$relative" ]; then
+        digest="$(checksum_file "$relative")"
+        printf '%s  %s\n' "$digest" "$relative" >> backup/SHA256SUMS
+      fi
+    done
+  )
+  mv "$partial" "$package"
+  success=1
+  log "Backup complete: $package"
+  log "To install on another computer, copy this entire folder, open it, and run ./run.sh restore"
+  log "This folder includes your data, login information, and encryption key; keep it private."
+)
 
-  log "Backup complete."
-}
+cmd_restore() (
+  local payload="$PROJECT_DIR/backup" relative expected actual architecture
+  local restore_started=0 restore_complete=0 verified="|"
+  require_podman
+  [ "$#" -eq 0 ] || die "Open the portable backup folder and run ./run.sh restore without arguments."
+  [ -f "$payload/format" ] || die "No portable backup found here. Open a caritas-backup-* folder and run ./run.sh restore."
+  [ "$(cat "$payload/format")" = "caritas-portable-backup-v1" ] || die "Unsupported backup format."
+  [ -s "$payload/SHA256SUMS" ] || die "Backup checksum list is missing."
+  log "Checking backup files."
+  while IFS=' ' read -r expected relative; do
+    case "$relative" in
+      run.sh|Containerfile.ingest|Containerfile.superset|.caritas-settings.env|scripts/*.py|superset/*.py|backup/*) ;;
+      data/README.md|data/codebook.csv|data/en/counselling_events.csv|data/de/beratungsdaten_synthesized.csv|sql/schema_en.sql|sql/schema_de.sql) ;;
+      *) die "Unexpected file in backup checksum list: $relative" ;;
+    esac
+    case "$relative" in *..*|/*) die "Invalid backup path: $relative" ;; esac
+    [ -f "$PROJECT_DIR/$relative" ] && [ ! -L "$PROJECT_DIR/$relative" ] || die "Backup file is missing: $relative"
+    actual="$(checksum_file "$PROJECT_DIR/$relative")"
+    [ "$expected" = "$actual" ] || die "Backup file is damaged: $relative"
+    verified="$verified$relative|"
+  done < "$payload/SHA256SUMS"
+  for relative in run.sh Containerfile.ingest Containerfile.superset \
+    .caritas-settings.env scripts/import_staging.py scripts/import_ui.py \
+    superset/superset_config.py superset/enable_file_upload.py \
+    backup/format backup/architecture backup/postgres.dump \
+    backup/superset-home.tgz backup/images.tar; do
+    case "$verified" in
+      *"|$relative|"*) ;;
+      *) die "Backup checksum is missing for $relative" ;;
+    esac
+  done
+  for relative in postgres.dump superset-home.tgz images.tar architecture; do
+    [ -s "$payload/$relative" ] || die "Backup file is missing or empty: $relative"
+  done
+  architecture="$(podman info --format '{{.Host.Arch}}')"
+  [ "$(cat "$payload/architecture")" = "$architecture" ] || die "This backup was made for a different CPU architecture. Restore it on the same architecture."
+  for relative in "$POSTGRES_CONTAINER" "$SUPERSET_CONTAINER" "$IMPORT_UI_CONTAINER"; do
+    ! container_exists "$relative" || die "Restore refused: container $relative already exists. Use a fresh installation; existing data has not been changed."
+  done
+  for relative in "$POSTGRES_VOLUME" "$SUPERSET_VOLUME"; do
+    ! podman volume exists "$relative" >/dev/null 2>&1 || die "Restore refused: volume $relative already exists. Use a fresh installation; existing data has not been changed."
+  done
+  restore_cleanup() {
+    local result=$? item
+    trap - EXIT
+    if [ "$restore_started" -eq 1 ] && [ "$restore_complete" -ne 1 ]; then
+      log "Restore failed. Removing only the new containers and volumes created by this restore."
+      for item in "$IMPORT_UI_CONTAINER" "$SUPERSET_CONTAINER" "$POSTGRES_CONTAINER"; do
+        if container_exists "$item"; then podman rm -f "$item" >/dev/null || true; fi
+      done
+      for item in "$SUPERSET_VOLUME" "$POSTGRES_VOLUME"; do
+        if podman volume exists "$item" >/dev/null 2>&1; then podman volume rm "$item" >/dev/null || true; fi
+      done
+      rm -f "$PROJECT_DIR/.caritas-restored"
+    fi
+    exit "$result"
+  }
+  trap restore_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  log "Loading bundled container images."
+  podman load -i "$payload/images.tar"
+  for relative in "$POSTGRES_IMAGE" "$SUPERSET_IMAGE" "$INGEST_IMAGE"; do
+    podman image exists "$relative" >/dev/null 2>&1 || die "Required image is missing from backup: $relative"
+  done
+  ensure_dirs
+  configure_host_ports
+  ensure_network
+  restore_started=1
+  ensure_volumes
+  log "Restoring Superset metadata."
+  podman run --rm \
+    -v "$SUPERSET_VOLUME:/volume" \
+    -v "$payload:/backup:ro" \
+    "$POSTGRES_IMAGE" \
+    tar -xzf /backup/superset-home.tgz -C /volume
+  start_postgres
+  log "Restoring PostgreSQL data."
+  podman exec -i "$POSTGRES_CONTAINER" pg_restore \
+    --exit-on-error --clean --if-exists --no-owner --no-acl \
+    -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$payload/postgres.dump"
+  RESTORING_BACKUP=1
+  start_superset
+  start_import_ui
+  touch "$PROJECT_DIR/.caritas-restored"
+  restore_complete=1
+  log "Restore complete. Your Superset users, charts, and dashboards have been restored."
+  log "Superset:  http://127.0.0.1:${SUPERSET_PORT}"
+  log "Import UI: http://127.0.0.1:${IMPORT_UI_PORT}"
+)
 
 cmd_reset() {
   require_podman
@@ -729,6 +988,10 @@ main() {
       ;;
     backup)
       cmd_backup
+      ;;
+    restore)
+      shift
+      cmd_restore "$@"
       ;;
     build)
       build_images

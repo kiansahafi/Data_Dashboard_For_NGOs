@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import uuid
@@ -12,21 +13,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import psycopg2
-from flask import Flask, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
 from scripts.import_staging import (
-    POSTGRES_TYPES,
-    STAGING_TRANSFORMS,
+    TRANSFORM_OPTIONS_BY_TYPE,
     bootstrap,
-    clean_cell_value,
     delete_existing_import,
     detect_column_types,
     insert_frame,
     load_frames,
     normalize_frame,
     table_name_for,
+    validate_column,
+    staging_schema_conflicts,
 )
 
 
@@ -41,10 +42,6 @@ TYPE_OPTIONS = [
     ("numeric", "Decimal number"),
     ("date", "Date"),
     ("timestamp", "Date and time"),
-]
-TRANSFORM_OPTIONS = [
-    ("none", "Keep value"),
-    ("leading_number", "Extract leading number"),
 ]
 
 app = Flask(__name__)
@@ -136,6 +133,17 @@ BASE_STYLE = """
     font-size: 12px;
   }
   .messages li { margin: 6px 0; }
+  button:disabled { cursor: wait; opacity: .55; }
+  .validation { min-width: 210px; }
+  .valid { color: #17633b; }
+  .invalid { color: #9f2424; }
+  .invalid-row { background: #fff8f8; }
+  .examples { margin: 8px 0; padding-left: 18px; }
+  .examples li { margin-bottom: 5px; overflow-wrap: anywhere; }
+  .validation-summary { margin: 14px 0; }
+  .error[hidden] { display: none; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; }
   @media (max-width: 760px) {
     main { padding: 20px 12px 36px; }
     table { display: block; overflow-x: auto; white-space: nowrap; }
@@ -171,67 +179,69 @@ PREVIEW_TEMPLATE = (
     + """
 <main>
   <h1>Review Import</h1>
-  <p class="hint">File: <strong>{{ filename }}</strong>. Suggested types can be changed before import.</p>
+  <p class="hint">File: <strong>{{ filename }}</strong>. Choose the type and conversion for each column. Every data row is checked.</p>
 
   {% if skipped %}
     <div class="panel">
       <strong>Skipped sheets</strong>
-      <ul class="messages">
-        {% for message in skipped %}<li>{{ message }}</li>{% endfor %}
-      </ul>
+      <ul class="messages">{% for message in skipped %}<li>{{ message }}</li>{% endfor %}</ul>
     </div>
   {% endif %}
 
-  <form action="/import" method="post">
+  <form id="review-form" action="/import" method="post">
     <input type="hidden" name="token" value="{{ token }}">
     <div class="panel">
       <label>
-        <input type="checkbox" name="replace_existing" value="yes" checked>
+        <input type="checkbox" name="replace_existing" value="yes" {% if replace_existing %}checked{% endif %}>
         Replace existing staging tables for this file/sheet before importing
       </label>
-      <p class="hint">Uncheck this if you intentionally want to append another batch.</p>
+      <p class="hint">Uncheck to append rows. Appending keeps existing column types; replacing recreates the table with your selected types.</p>
+      <p class="hint">Replacing also removes database views that depend on this table. Recreate those views afterwards.</p>
     </div>
+    <div id="review-errors" class="error" role="alert" {% if not errors %}hidden{% endif %}>
+      <ul class="messages">{% for message in errors %}<li>{{ message }}</li>{% endfor %}</ul>
+    </div>
+    <p id="validation-summary" class="validation-summary" role="status" aria-live="polite">{{ summary }}</p>
 
     {% for sheet in sheets %}
-      <h2>{{ sheet.label }} -> staging.{{ sheet.table_name }}</h2>
+      <h2>{{ sheet.label }} &rarr; staging.{{ sheet.table_name }}</h2>
+      <p class="hint">{{ sheet.row_count }} data rows. Source row numbers count records including the header. A quoted CSV value spanning several lines counts as one record.</p>
       <table>
         <thead>
-          <tr>
-            <th>Column</th>
-            <th>Sample values</th>
-            <th>Suggested</th>
-            <th>Use type</th>
-            <th>Transform</th>
-          </tr>
+          <tr><th>Column</th><th>Suggested</th><th>Use type</th><th>Transform</th><th>Validation</th></tr>
         </thead>
         <tbody>
           {% for column in sheet.columns %}
-            <tr>
-              <td>
-                <strong>{{ column.original_name }}</strong>
-                <div class="hint">{{ column.name }}</div>
-              </td>
-              <td class="sample">
-                {% for value in column.sample_values %}
-                  <code>{{ value }}</code>
-                {% else %}
-                  <span class="hint">No non-empty sample</span>
-                {% endfor %}
-              </td>
+            <tr data-sheet="{{ sheet.index }}" data-column="{{ column.name }}" {% if column.validation.invalid_count or column.validation.errors %}class="invalid-row"{% endif %}>
+              <td><strong>{{ column.original_name }}</strong><div class="hint">{{ column.name }}</div></td>
               <td>{{ column.suggested_label }}</td>
               <td>
-                <select name="type__{{ sheet.index }}__{{ column.name }}">
+                <select aria-label="Type for {{ column.original_name }}" class="type-select" name="type__{{ sheet.index }}__{{ column.name }}">
                   {% for value, label in type_options %}
-                    <option value="{{ value }}" {% if value == column.suggested_type %}selected{% endif %}>{{ label }}</option>
+                    <option value="{{ value }}" {% if value == column.selected_type %}selected{% endif %}>{{ label }}</option>
                   {% endfor %}
                 </select>
               </td>
               <td>
-                <select name="transform__{{ sheet.index }}__{{ column.name }}">
-                  {% for value, label in transform_options %}
-                    <option value="{{ value }}">{{ label }}</option>
+                <select aria-label="Transform for {{ column.original_name }}" class="transform-select" name="transform__{{ sheet.index }}__{{ column.name }}">
+                  {% for value, label in transform_options_by_type.get(column.selected_type, []) %}
+                    <option value="{{ value }}" {% if value == column.selected_transform %}selected{% endif %}>{{ label }}</option>
                   {% endfor %}
                 </select>
+              </td>
+              <td class="validation">
+                <div class="counts {% if column.validation.invalid_count or column.validation.errors %}invalid{% else %}valid{% endif %}">{{ column.validation.valid_count }} valid, {{ column.validation.empty_count }} empty, {{ column.validation.invalid_count }} invalid</div>
+                {% if column.validation.errors %}<ul class="examples invalid">{% for error in column.validation.errors %}<li>{{ error }}</li>{% endfor %}</ul>{% endif %}
+                {% if column.validation.invalid_examples %}
+                  <details open><summary>Values to fix (up to {{ sample_limit }})</summary><ul class="examples invalid">
+                    {% for example in column.validation.invalid_examples %}<li>Row {{ example.source_row_number }}: <code>{{ example.value }}</code>. {{ example.error }}</li>{% endfor %}
+                  </ul></details>
+                {% endif %}
+                {% if column.validation.valid_examples %}
+                  <details><summary>Valid conversions (up to {{ sample_limit }})</summary><ul class="examples">
+                    {% for example in column.validation.valid_examples %}<li>Row {{ example.source_row_number }}: <code>{{ example.value }}</code> &rarr; <code>{{ example.converted }}</code></li>{% endfor %}
+                  </ul></details>
+                {% endif %}
               </td>
             </tr>
           {% endfor %}
@@ -240,12 +250,135 @@ PREVIEW_TEMPLATE = (
     {% endfor %}
 
     <div class="toolbar">
-      <button type="submit">Import data</button>
+      <button id="import-button" type="submit" {% if not valid %}disabled{% endif %}>Import data</button>
+      <button class="secondary" type="submit" formaction="/review">Check changes</button>
       <a class="button secondary" href="/">Choose another file</a>
     </div>
-    <p class="hint">Use "Extract leading number" with a numeric type for values such as <code>03 Familie</code>. Without a leading number, the imported staging value becomes empty.</p>
+    <p class="hint">Empty cells stay empty. Invalid values must be fixed in the source file or converted with a suitable type and transform.</p>
+    <noscript><p class="hint">After changing a choice, use Check changes to update the validation.</p></noscript>
   </form>
 </main>
+<script>
+(() => {
+  const optionsByType = {{ transform_options_by_type | tojson }};
+  const form = document.getElementById('review-form');
+  const importButton = document.getElementById('import-button');
+  const summary = document.getElementById('validation-summary');
+  const errors = document.getElementById('review-errors');
+  let timer;
+  let controller;
+  let revision = 0;
+
+  function showErrors(messages) {
+    errors.replaceChildren();
+    errors.hidden = !messages.length;
+    const list = document.createElement('ul');
+    list.className = 'messages';
+    messages.forEach(message => {
+      const item = document.createElement('li');
+      item.textContent = message;
+      list.append(item);
+    });
+    errors.append(list);
+  }
+
+  function showExamples(cell, examples, invalid) {
+    if (!examples.length) return;
+    const details = document.createElement('details');
+    details.open = invalid;
+    const label = document.createElement('summary');
+    label.textContent = (invalid ? 'Values to fix' : 'Valid conversions') + ' (up to {{ sample_limit }})';
+    details.append(label);
+    const list = document.createElement('ul');
+    list.className = 'examples' + (invalid ? ' invalid' : '');
+    examples.forEach(example => {
+      const item = document.createElement('li');
+      item.append(document.createTextNode('Row ' + example.source_row_number + ': '));
+      const value = document.createElement('code');
+      value.textContent = example.value;
+      item.append(value);
+      if (invalid) {
+        item.append(document.createTextNode('. ' + example.error));
+      } else {
+        item.append(document.createTextNode(' → '));
+        const converted = document.createElement('code');
+        converted.textContent = example.converted;
+        item.append(converted);
+      }
+      list.append(item);
+    });
+    details.append(list);
+    cell.append(details);
+  }
+
+  function renderValidation(data) {
+    showErrors(data.errors || []);
+    summary.textContent = data.summary;
+    for (const sheet of data.sheets || []) {
+      for (const column of sheet.columns) {
+        const row = form.querySelector('[data-sheet="' + sheet.index + '"][data-column="' + column.name + '"]');
+        if (!row) continue;
+        const cell = row.querySelector('.validation');
+        const report = column.validation;
+        const invalid = report.invalid_count > 0 || report.errors.length > 0;
+        row.classList.toggle('invalid-row', invalid);
+        cell.replaceChildren();
+        const counts = document.createElement('div');
+        counts.className = 'counts ' + (invalid ? 'invalid' : 'valid');
+        counts.textContent = report.valid_count + ' valid, ' + report.empty_count + ' empty, ' + report.invalid_count + ' invalid';
+        cell.append(counts);
+        if (report.errors.length) {
+          const list = document.createElement('ul');
+          list.className = 'examples invalid';
+          report.errors.forEach(message => {
+            const item = document.createElement('li');
+            item.textContent = message;
+            list.append(item);
+          });
+          cell.append(list);
+        }
+        showExamples(cell, report.invalid_examples, true);
+        showExamples(cell, report.valid_examples, false);
+      }
+    }
+    importButton.disabled = !data.valid;
+  }
+
+  async function validate(currentRevision) {
+    controller = new AbortController();
+    try {
+      const response = await fetch('/validate', {method: 'POST', body: new FormData(form), signal: controller.signal});
+      const data = await response.json();
+      if (revision !== currentRevision) return;
+      if (!response.ok) throw new Error((data.errors || ['Could not check this file.']).join(' '));
+      renderValidation(data);
+    } catch (error) {
+      if (error.name === 'AbortError' || revision !== currentRevision) return;
+      showErrors([error.message || 'Could not check this file. Use Check changes to retry.']);
+      summary.textContent = 'Validation failed. Import is paused until the file can be checked.';
+      importButton.disabled = true;
+    }
+  }
+
+  form.addEventListener('change', event => {
+    if (event.target.matches('.type-select')) {
+      const transform = event.target.closest('tr').querySelector('.transform-select');
+      const previous = transform.value;
+      const options = optionsByType[event.target.value] || [];
+      transform.replaceChildren();
+      options.forEach(([value, label]) => transform.add(new Option(label, value)));
+      transform.value = options.some(([value]) => value === previous) ? previous : 'none';
+    }
+    revision += 1;
+    if (controller) controller.abort();
+    clearTimeout(timer);
+    importButton.disabled = true;
+    summary.textContent = 'Checking all rows…';
+    const currentRevision = revision;
+    timer = setTimeout(() => validate(currentRevision), 180);
+  });
+})();
+</script>
 """
 )
 
@@ -288,7 +421,7 @@ def cleanup_uploads() -> None:
 
 
 def uploaded_path_for_token(token: str) -> Path | None:
-    if not token or "/" in token:
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
         return None
     matches = sorted(UPLOAD_DIR.glob(f"{token}__*"))
     return matches[0] if matches else None
@@ -313,28 +446,22 @@ def save_upload(file: FileStorage) -> tuple[str, Path]:
     return token, path
 
 
-def sample_values(series) -> list[str]:
-    values = []
-    for value in series:
-        value = clean_cell_value(value)
-        if value is None:
-            continue
-        values.append(str(value))
-        if len(values) == SAMPLE_LIMIT:
-            break
-    return values
-
-
 def label_for_type(column_type: str) -> str:
     return dict(TYPE_OPTIONS).get(column_type, column_type)
 
 
-def preview_context(path: Path, token: str) -> dict[str, object]:
+def _build_review(path: Path, token: str, selections=None, check_schema=True):
     frames = load_frames(path)
     multiple_sheets = len(frames) > 1
     source_path = Path(original_upload_name(path))
+    selections = selections if selections is not None else {"replace_existing": "yes"}
+    replace_existing = selections.get("replace_existing") == "yes"
     sheets = []
+    prepared = []
     skipped = []
+    errors = []
+    valid_count = empty_count = invalid_count = 0
+    tables = set()
 
     for index, (sheet_name, frame) in enumerate(frames):
         label = sheet_name or source_path.name
@@ -345,40 +472,72 @@ def preview_context(path: Path, token: str) -> dict[str, object]:
         normalized, original_columns = normalize_frame(frame)
         suggested_types = detect_column_types(normalized)
         table_name = table_name_for(source_path, sheet_name, multiple_sheets)
+        if table_name in tables:
+            errors.append(f"More than one sheet maps to staging.{table_name}. Rename the sheets so they have different table names.")
+        tables.add(table_name)
         columns = []
+        column_types = {}
+        column_transforms = {}
 
         for name, original_name in zip(normalized.columns, original_columns):
             suggested_type = suggested_types[name]
-            columns.append(
-                {
-                    "name": name,
-                    "original_name": original_name,
-                    "sample_values": sample_values(normalized[name]),
-                    "suggested_type": suggested_type,
-                    "suggested_label": label_for_type(suggested_type),
-                }
-            )
+            selected_type = selections.get(f"type__{index}__{name}", suggested_type)
+            selected_transform = selections.get(f"transform__{index}__{name}", "none")
+            column_types[name] = selected_type
+            column_transforms[name] = selected_transform
+            report = validate_column(normalized[name], name, selected_type, selected_transform, sample_limit=SAMPLE_LIMIT)
+            # Configuration errors are distinct from invalid cell values.
+            report.setdefault("errors", [])
+            valid_count += report["valid_count"]
+            empty_count += report["empty_count"]
+            invalid_count += report["invalid_count"]
+            columns.append({
+                "name": name,
+                "original_name": original_name,
+                "suggested_type": suggested_type,
+                "suggested_label": label_for_type(suggested_type),
+                "selected_type": selected_type,
+                "selected_transform": selected_transform,
+                "validation": report,
+            })
 
-        sheets.append(
-            {
-                "index": index,
-                "label": label,
-                "table_name": table_name,
-                "columns": columns,
-            }
-        )
+        sheets.append({"index": index, "label": label, "table_name": table_name, "row_count": len(normalized), "columns": columns})
+        prepared.append({"sheet_name": sheet_name, "table_name": table_name, "frame": normalized, "original_columns": original_columns, "column_types": column_types, "column_transforms": column_transforms})
 
     if not sheets:
         raise ValueError("No non-empty sheets were found.")
 
+    configuration_errors = any(column["validation"]["errors"] for sheet in sheets for column in sheet["columns"])
+    if check_schema and not replace_existing and not configuration_errors:
+        try:
+            with psycopg2.connect("") as conn:
+                for item in prepared:
+                    errors.extend(staging_schema_conflicts(conn, item["table_name"], item["column_types"]))
+        except psycopg2.Error:
+            errors.append("Could not check the existing table definitions. Check that PostgreSQL is running, then use Check changes.")
+
+    valid = invalid_count == 0 and not configuration_errors and not errors
+    if valid:
+        summary = f"All rows checked: {valid_count} valid values and {empty_count} empty cells. Ready to import."
+    else:
+        summary = f"All rows checked: {valid_count} valid values, {empty_count} empty cells and {invalid_count} invalid values. Resolve the errors before importing."
     return {
-        "filename": original_upload_name(path),
-        "token": token,
-        "sheets": sheets,
-        "skipped": skipped,
+        "filename": original_upload_name(path), "token": token,
+        "sheets": sheets, "skipped": skipped, "errors": errors,
+        "replace_existing": replace_existing,
+        "valid": valid, "summary": summary,
         "type_options": TYPE_OPTIONS,
-        "transform_options": TRANSFORM_OPTIONS,
-    }
+        "transform_options_by_type": TRANSFORM_OPTIONS_BY_TYPE,
+        "sample_limit": SAMPLE_LIMIT,
+    }, prepared
+
+
+def preview_context(path: Path, token: str, selections=None) -> dict[str, object]:
+    return _build_review(path, token, selections)[0]
+
+
+def _validation_payload(context):
+    return {key: context[key] for key in ("valid", "summary", "sheets", "errors")}
 
 
 @app.get("/")
@@ -408,87 +567,70 @@ def preview_import():
     return render_template_string(PREVIEW_TEMPLATE, **context)
 
 
+@app.post("/validate")
+def validate_reviewed_file():
+    token = request.form.get("token", "")
+    path = uploaded_path_for_token(token)
+    if path is None:
+        return jsonify(valid=False, errors=["The uploaded file is no longer available. Upload it again."]), 400
+    try:
+        context = preview_context(path, token, request.form)
+        return jsonify(_validation_payload(context))
+    except Exception as exc:
+        return jsonify(valid=False, errors=[str(exc)]), 400
+
+
+@app.post("/review")
+def review_changes():
+    token = request.form.get("token", "")
+    path = uploaded_path_for_token(token)
+    if path is None:
+        return render_template_string(UPLOAD_TEMPLATE, error="The uploaded file is no longer available. Upload it again.", superset_url=superset_url()), 400
+    try:
+        context = preview_context(path, token, request.form)
+    except Exception as exc:
+        return render_template_string(UPLOAD_TEMPLATE, error=str(exc), superset_url=superset_url()), 400
+    return render_template_string(PREVIEW_TEMPLATE, **context)
+
+
 @app.post("/import")
 def import_reviewed_file():
     token = request.form.get("token", "")
     path = uploaded_path_for_token(token)
     if path is None:
-        return render_template_string(
-            RESULT_TEMPLATE,
-            error="The uploaded file is no longer available. Upload it again.",
-            messages=[],
-            superset_url=superset_url(),
-        ), 400
+        return render_template_string(UPLOAD_TEMPLATE, error="The uploaded file is no longer available. Upload it again.", superset_url=superset_url()), 400
 
+    context = None
     try:
-        frames = load_frames(path)
-        multiple_sheets = len(frames) > 1
-        replace_existing = request.form.get("replace_existing") == "yes"
+        # Recheck every row on the server, including submissions without JavaScript.
+        context, prepared = _build_review(path, token, request.form, check_schema=False)
+        if not context["valid"]:
+            return render_template_string(PREVIEW_TEMPLATE, **context), 400
+
         messages = []
-
+        source_path = Path(original_upload_name(path))
         with psycopg2.connect("") as conn:
+            if not context["replace_existing"]:
+                conflicts = []
+                for item in prepared:
+                    conflicts.extend(staging_schema_conflicts(conn, item["table_name"], item["column_types"]))
+                if conflicts:
+                    raise ValueError(" ".join(conflicts))
             bootstrap(conn)
-            source_path = Path(original_upload_name(path))
-            for index, (sheet_name, frame) in enumerate(frames):
-                if frame.empty and len(frame.columns) == 0:
-                    continue
-
-                normalized, original_columns = normalize_frame(frame)
-                table_name = table_name_for(source_path, sheet_name, multiple_sheets)
-                detected_types = detect_column_types(normalized)
-                column_types = {}
-                column_transforms = {}
-
-                for column in normalized.columns:
-                    selected_type = request.form.get(
-                        f"type__{index}__{column}", detected_types[column]
-                    )
-                    selected_transform = request.form.get(
-                        f"transform__{index}__{column}", "none"
-                    )
-                    if selected_type not in POSTGRES_TYPES:
-                        raise ValueError(f"Unsupported type for {column}: {selected_type}")
-                    if selected_transform not in STAGING_TRANSFORMS:
-                        raise ValueError(
-                            f"Unsupported transform for {column}: {selected_transform}"
-                        )
-                    column_types[column] = selected_type
-                    column_transforms[column] = selected_transform
-
-                if replace_existing:
-                    delete_existing_import(conn, table_name)
-
-                batch_id = insert_frame(
-                    conn,
-                    path=source_path,
-                    sheet_name=sheet_name,
-                    table_name=table_name,
-                    frame=normalized,
-                    original_columns=original_columns,
-                    column_types=column_types,
-                    column_transforms=column_transforms,
-                )
-                messages.append(
-                    f"Imported {len(normalized)} rows into staging.{table_name} "
-                    f"(batch_id={batch_id})"
-                )
-
-        if not messages:
-            raise ValueError("No non-empty sheets were found.")
+            for item in prepared:
+                if context["replace_existing"]:
+                    delete_existing_import(conn, item["table_name"])
+                batch_id = insert_frame(conn, path=source_path, **item)
+                messages.append(f"Imported {len(item['frame'])} rows into staging.{item['table_name']} (batch_id={batch_id})")
     except Exception as exc:
-        return render_template_string(
-            RESULT_TEMPLATE,
-            error=str(exc),
-            messages=[],
-            superset_url=superset_url(),
-        ), 400
+        if context is not None:
+            context["errors"].append(str(exc))
+            context["valid"] = False
+            context["summary"] = "Import did not complete. Review the error, adjust your choices and try again."
+            return render_template_string(PREVIEW_TEMPLATE, **context), 400
+        return render_template_string(UPLOAD_TEMPLATE, error=str(exc), superset_url=superset_url()), 400
 
-    return render_template_string(
-        RESULT_TEMPLATE,
-        error=None,
-        messages=messages,
-        superset_url=superset_url(),
-    )
+    return render_template_string(RESULT_TEMPLATE, error=None, messages=messages, superset_url=superset_url())
 
 
 if __name__ == "__main__":
