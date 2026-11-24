@@ -6,7 +6,7 @@ The dashboard is built on [Apache Superset](https://superset.apache.org/) and [P
 
 ![Dashboard prototype: interactions, event types and reasons for support](docs/images/dashboard-prototype.png)
 
-*The earlier dashboard prototype. The local app currently lets you import data and build your own charts; a ready-made dashboard export is not included.*
+*The dashboard prototype. The local app currently lets you import data and build your own charts.*
 
 It grew out of a research cooperation between the [Bern University of Applied Sciences (BFH)](https://www.bfh.ch/soziale-arbeit/) and Caritas Switzerland within the SNSF National Research Programme "Covid-19 in Society" (NRP 80), the research project “[Civil Society Organisations as Agents of Innovation](https://www.bfh.ch/en/research/research-projects/2026-416-220-497/)”, and the Innosuisse – Swiss Innovation Agency Project "[Datennutzung Caritas](https://doi.org/10.24451/dspace/11848)". It is designed so it can be used by any CSO - free of charge and open source.
 
