@@ -8,7 +8,7 @@ The dashboard is built on [Apache Superset](https://superset.apache.org/) and [P
 
 *The dashboard prototype. The local app currently lets you import data and build your own charts.*
 
-It grew out of a research cooperation between the [Bern University of Applied Sciences (BFH)](https://www.bfh.ch/soziale-arbeit/) and Caritas Switzerland within the SNSF National Research Programme "Covid-19 in Society" (NRP 80), the research project “[Civil Society Organisations as Agents of Innovation](https://www.bfh.ch/en/research/research-projects/2026-416-220-497/)”, and the Innosuisse – Swiss Innovation Agency Project "[Datennutzung Caritas](https://doi.org/10.24451/dspace/11848)". It is designed so it can be used by any CSO - free of charge and open source.
+It grew out of a research cooperation between the Bern University of Applied Sciences (BFH) and Caritas Switzerland within the SNSF NRP 80 project ["Poverty and social security in time of crisis" (PI: O. Hümbelin)](https://www.nfp80.ch/en/fhRyLtkBS8JWMatg/project/poverty-and-social-security-during-the-covid-19-pandemic), the research project “[Civil Society Organisations as Agents of Innovation](https://www.bfh.ch/en/research/research-projects/2026-416-220-497/)”, and the Innosuisse – Swiss Innovation Agency Project "[Datennutzung Caritas](https://doi.org/10.24451/dspace/11848)". It is designed so it can be used by any CSO - free of charge and open source.
 
 > **Status:** this is an early version of the data dashboard. A full release with pre-configured statistics charts will follow up as soon as we find the time for it. Please also see the [Limitations](#limitations).
 
@@ -239,7 +239,10 @@ If you use this software, please cite this repository and the data standard:
 
 > Caritas Schweiz & Sutter, R. (2026). *Datenstandard Sozialberatung im Caritas-Netz Schweiz* (Version 1.0). Zenodo. https://doi.org/10.5281/zenodo.22919492
 
-For the conceptual background, please cite Sutter & Hümbelin (2026a).
+For the conceptual background, please cite Sutter & Hümbelin:
+
+Sutter, R., & Hümbelin, O. (2026a). Evidence-based policy engagement of social welfare non-governmental organisations: A case study on the democratic relevance of Caritas Switzerland's data ecosystem. European Social Work Research, 4(2), 233–253. https://doi.org/10.1332/27551768Y2026D000000079 (freely accessible working paper version: https://ideas.repec.org/p/bss/wpaper/61.html)
+
 
 ## Credits, funding and licence
 
