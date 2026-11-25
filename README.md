@@ -2,7 +2,7 @@
 
 **An open-source, local-first dashboard that helps civil society organisations (CSOs) turn the data they already record during their work into evidence – for their own practice, their strategy and social policy advocacy.**
 
-The dashboard is built on [Apache Superset](https://superset.apache.org/) and [PostgreSQL](https://www.postgresql.org/) and runs in containers on an ordinary laptop. **It is built for local use:** no cloud, no hosted server and no internet connection needed once it is installed. Client data stay on the organisation's own computer unless someone chooses to export or share them. The supplied demo data follow this [data standard for social counselling from Caritas](https://doi.org/10.5281/zenodo.22919492), an openly licensed minimum set of eleven characteristics. They are fully synthetic, so anyone can try the app without touching a real case.
+The dashboard is built on [Apache Superset](https://superset.apache.org/) and [PostgreSQL](https://www.postgresql.org/) and runs in containers on an ordinary laptop. **It is built for local use:** no cloud, no hosted server and no internet connection needed once it is installed. All data stays on your own computer unless you choose to export or share them. Organisations can use their own data or test the tool with the simulated data included. The supplied demo data follow this data standard, an openly licensed minimum set of eleven characteristics in documented social work. 
 
 ![Dashboard prototype: interactions, event types and reasons for support](docs/images/dashboard-prototype.png)
 
