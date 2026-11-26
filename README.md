@@ -237,6 +237,8 @@ The dashboard rests on three successful projects:
 
 If you use this software, please cite this repository and the data standard:
 
+> Sutter, R., Sahafi, K., Glaus, J., & Hümbelin, O. (2027). Data Dashboard for NGOs: An open-source tool that turns NGO data into evidence (Version 1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.24526323
+
 > Caritas Schweiz & Sutter, R. (2026). *Datenstandard Sozialberatung im Caritas-Netz Schweiz* (Version 1.0). Zenodo. https://doi.org/10.5281/zenodo.22919492
 
 For the conceptual background, please cite Sutter & Hümbelin:
